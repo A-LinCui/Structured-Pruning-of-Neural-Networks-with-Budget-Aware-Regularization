@@ -120,18 +120,18 @@ class CIFARResNet(nn.Module):
         return out
 
     def add_wrapper(self, before_bn: bool = False, **kwargs) -> None:
+        def layer_add_wrapper(layer: nn.Module, before_bn: bool = False, **kwargs) -> None:
+            for block in layer:
+                block.add_wrapper(before_bn, **kwargs)
+        
         if before_bn:
             self.conv1 = BARStructuredWrapper(self.conv1, **kwargs)
         else:
             self.bn1 = BARStructuredWrapper(self.bn1, **kwargs)
-        self.layer_add_wrapper(self.layer1, before_bn, **kwargs)
-        self.layer_add_wrapper(self.layer2, before_bn, **kwargs)
-        self.layer_add_wrapper(self.layer3, before_bn, **kwargs)
-        self.layer_add_wrapper(self.layer4, before_bn, **kwargs)
-
-    def layer_add_wrapper(self, layer: nn.Module, before_bn: bool = False, **kwargs) -> None:
-        for block in layer:
-            block.add_wrapper(before_bn, **kwargs)
+        layer_add_wrapper(self.layer1, before_bn, **kwargs)
+        layer_add_wrapper(self.layer2, before_bn, **kwargs)
+        layer_add_wrapper(self.layer3, before_bn, **kwargs)
+        layer_add_wrapper(self.layer4, before_bn, **kwargs)
 
 
 def CIFARResNet18(num_classes: int) -> CIFARResNet:
