@@ -67,3 +67,13 @@ class BARStructuredWrapper(nn.Module):
         s_bar = s * (self.zeta - self.gamma) + self.gamma
         z = torch.clamp(s_bar, min = 0., max = 1.)
         return z
+
+    @property
+    def computation_overhead(self) -> float:
+        r"""
+        Get the computation overhead.
+
+        Returns:
+            area (float): The computation overhead is defined as the area in BAR.
+        """
+        return self.area
