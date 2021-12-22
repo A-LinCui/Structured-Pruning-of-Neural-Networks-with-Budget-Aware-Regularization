@@ -4,10 +4,18 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
-from wrapper import BARStructuredWrapper
+from .wrapper import BARStructuredWrapper
 
 
 class BasicBlock(nn.Module):
+    r"""
+    Basic block for ResNet.
+
+    Args:
+        in_planes (int): Input channel number.
+        planes (int): Output channel number.
+        stride (int): Stride of the convolution.
+    """
     expansion = 1
 
     def __init__(self, in_planes: int, planes: int, stride: int = 1) -> None:
@@ -23,15 +31,48 @@ class BasicBlock(nn.Module):
                 nn.Conv2d(in_planes, self.expansion * planes, kernel_size = 1, stride = stride, bias = False),
                 nn.BatchNorm2d(self.expansion * planes)
             )
+        
+        self._before_bn = None
 
-    def forward(self, x: Tensor) -> Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
+    def forward(self, input: Tensor) -> Tensor:
+        r"""
+        Calculate the output feature. 
+        The Atopological grouping strategy ("DSA: More Efficient Budgeted Pruning via 
+        Differentiable Sparsity Allocation, `Link_`") is applied.
+
+        Args:
+            input (Tensor): Input feature.
+
+        Returns:
+            out (Tensor): Output feature.
+
+        .. _Link:
+            https://arxiv.org/abs/2004.02164
+       """
+        # Topological Grouping
+        if self._before_bn is not None and len(self.shortcut) > 0:
+            if self._before_bn:
+                self.conv2.log_alpha = self.conv1.log_alpha
+                self.shortcut[0].log_alpha = self.conv1.log_alpha
+            else:
+                self.bn2.log_alpha = self.bn1.log_alpha
+                self.shortcut[1].log_alpha = self.bn1.log_alpha
+
+        out = F.relu(self.bn1(self.conv1(input)))
+        out = self.bn2(self.conv2(out))    
+        out += self.shortcut(input)
         out = F.relu(out)
         return out
 
     def add_wrapper(self, before_bn: bool = False, **kwargs) -> None:
+        r"""
+        Add GATE wrapper for the origin network.
+
+        Args:
+            before_bn (bool): Whether add GATE before the batch-normalization layer.
+        """
+        self._before_bn = before_bn
+
         if before_bn:
             self.conv1 = BARStructuredWrapper(self.conv1, **kwargs)
             self.conv2 = BARStructuredWrapper(self.conv2, **kwargs)
@@ -43,8 +84,31 @@ class BasicBlock(nn.Module):
             if len(self.shortcut) > 0:
                 self.shortcut[1] = BARStructuredWrapper(self.shortcut[1], **kwargs)
 
+    def hard_prune(self) -> None:
+        r"""
+        Hard prune the network.
+        """
+        if self._before_bn:
+            self.conv1.hard_prune()
+            self.conv2.hard_prune()
+            if len(self.shortcut) > 0:
+                self.shortcut[0].hard_prune()
+        else:
+            self.bn1.hard_prune()
+            self.bn2.hard_prune()
+            if len(self.shortcut) > 0:
+                self.shortcut[1].hard_prune()
+
 
 class Bottleneck(nn.Module):
+    r"""
+    Bottle neck block for ResNet.
+
+    Args:
+        in_planes (int): Input channel number.
+        planes (int): Output channel number.
+        stride (int): Stride of the convolution.
+    """
     expansion = 4
 
     def __init__(self, in_planes: int, planes: int, stride: int = 1) -> None:
@@ -63,15 +127,50 @@ class Bottleneck(nn.Module):
                 nn.BatchNorm2d(self.expansion * planes)
             )
 
-    def forward(self, x: Tensor) -> Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
+        self._before_bn = None
+    
+    def forward(self, input: Tensor) -> Tensor:
+        r"""
+        Calculate the output feature. 
+        The Atopological grouping strategy ("DSA: More Efficient Budgeted Pruning via 
+        Differentiable Sparsity Allocation, `Link_`") is applied.
+
+        Args:
+            input (Tensor): Input feature.
+
+        Returns:
+            out (Tensor): Output feature.
+
+        .. _Link:
+            https://arxiv.org/abs/2004.02164
+       """
+        # Topological Grouping
+        if self._before_bn is not None and len(self.shortcut) > 0:
+            if self._before_bn:
+                self.conv2.log_alpha = self.conv1.log_alpha
+                self.conv3.log_alpha = self.conv1.log_alpha
+                self.shortcut[0].log_alpha = self.conv1.log_alpha
+            else:
+                self.bn2.log_alpha = self.bn1.log_alpha
+                self.bn3.log_alpha = self.bn1.log_alpha
+                self.shortcut[1].log_alpha = self.bn1.log_alpha
+
+        out = F.relu(self.bn1(self.conv1(input)))
         out = F.relu(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
-        out += self.shortcut(x)
+        out += self.shortcut(input)
         out = F.relu(out)
         return out
 
     def add_wrapper(self, before_bn: bool = False, **kwargs) -> None:
+        r"""
+        Add GATE wrapper for the origin network.
+
+        Args:
+            before_bn (bool): Whether add GATE before the batch-normalization layer.
+        """
+        self._before_bn = before_bn
+
         if before_bn:
             self.conv1 = BARStructuredWrapper(self.conv1, **kwargs)
             self.conv2 = BARStructuredWrapper(self.conv2, **kwargs)
@@ -84,6 +183,23 @@ class Bottleneck(nn.Module):
             self.bn3 = BARStructuredWrapper(self.bn3, **kwargs)
             if len(self.shortcut) > 0:
                 self.shortcut[1] = BARStructuredWrapper(self.shortcut[1], **kwargs)
+
+    def hard_prune(self) -> None:
+        r"""
+        Hard prune the network.
+        """
+        if self.before_bn:
+            self.conv1.hard_prune()
+            self.conv2.hard_prune()
+            self.conv3.hard_prune()
+            if len(self.shortcut) > 0:
+                self.shortcut[0].hard_prune()
+        else:
+            self.bn1.hard_prune()
+            self.bn2.hard_prune()
+            self.bn3.hard_prune()
+            if len(self.shortcut) > 0:
+                self.shortcut[1].hard_prune()
 
 
 class CIFARResNet(nn.Module):
@@ -98,6 +214,7 @@ class CIFARResNet(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride = 2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride = 2)
         self.linear = nn.Linear(512 * block.expansion, num_classes)
+        self._before_bn = None
 
     def _make_layer(self, block: Union[Bottleneck, BasicBlock], 
             planes: int, num_blocks: int, stride: int) -> nn.Module:
@@ -108,8 +225,8 @@ class CIFARResNet(nn.Module):
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-    def forward(self, x: Tensor) -> Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
+    def forward(self, input: Tensor) -> Tensor:
+        out = F.relu(self.bn1(self.conv1(input)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
@@ -120,9 +237,17 @@ class CIFARResNet(nn.Module):
         return out
 
     def add_wrapper(self, before_bn: bool = False, **kwargs) -> None:
+        r"""
+        Add GATE layers for the origin network.
+
+        Args:
+            before_bn (bool): Whether add GATE before the batch-normalization layer.
+        """
         def layer_add_wrapper(layer: nn.Module, before_bn: bool = False, **kwargs) -> None:
             for block in layer:
                 block.add_wrapper(before_bn, **kwargs)
+        
+        self._before_bn = before_bn
         
         if before_bn:
             self.conv1 = BARStructuredWrapper(self.conv1, **kwargs)
@@ -133,6 +258,23 @@ class CIFARResNet(nn.Module):
         layer_add_wrapper(self.layer3, before_bn, **kwargs)
         layer_add_wrapper(self.layer4, before_bn, **kwargs)
 
+    def hard_prune(self) -> None:
+        r"""
+        Apply hard pruning.
+        """
+        def layer_hard_prune(layer: nn.Module) -> None:
+            for block in layer:
+                block.hard_prune()
+        
+        if self._before_bn:
+            self.conv1.hard_prune()
+        else:
+            self.bn1.hard_prune()
+        layer_hard_prune(self.layer1)
+        layer_hard_prune(self.layer2)
+        layer_hard_prune(self.layer3)
+        layer_hard_prune(self.layer4)
+      
 
 def CIFARResNet18(num_classes: int) -> CIFARResNet:
     return CIFARResNet(BasicBlock, [2, 2, 2, 2], num_classes)

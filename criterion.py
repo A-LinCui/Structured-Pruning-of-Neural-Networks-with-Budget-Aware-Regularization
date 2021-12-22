@@ -1,10 +1,24 @@
 import numpy as np
+import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 from extorch.nn.utils import net_device
 
 from model.wrapper import BARStructuredWrapper
+
+
+def exp_progress_fn(p: float, a: float = 4.) -> float:
+    c = 1. - np.exp(-a)
+    exp_progress = 1. - np.exp(-a * p)
+    return exp_progress / c
+
+
+def sigmoid_progress_fn(p: float, a: float) -> float:
+    b = 1. / (1. + np.exp(a * 0.5))
+    sigmoid_progress = 1. / (1. + np.exp(a * (0.5 - p)))
+    sigmoid_progress = (sigmoid_progress - b) / (1. - 2. * b)
+    return sigmoid_progress
 
 
 class DistillationLoss(nn.Module):
@@ -16,6 +30,7 @@ class DistillationLoss(nn.Module):
         alpha (float): The coefficient to controll the trade-off between distillation loss and origin loss.
     """
     def __init__(self, T: float, alpha: float) -> None:
+        super(DistillationLoss, self).__init__()
         self.T = T
         self.alpha = alpha
 
@@ -60,7 +75,7 @@ class BudgetLoss(nn.Module):
             if isinstance(m, BARStructuredWrapper):
                 # Probability of being alive for each feature map
                 alive_probability = torch.sigmoid(
-                        m.log_alpha - m.beta * torch.log(-m.gamma / m.zeta))
+                        m.log_alpha - m.beta * np.log(-m.gamma / m.zeta))
                 loss += torch.sum(alive_probability) * m.computation_overhead
         return loss
 
@@ -70,32 +85,37 @@ class BARStructuredLoss(nn.Module):
     Objective of Budget-Aware Regularization Structured Pruning.
 
     Args:
-        budget (float):
+        budget (float): The budget.
+        epochs (int): Total pruning epochs.
         progress_func (str): Type of progress function ("sigmoid" or "exp"). Default: "sigmoid".
         _lambda (float): Coefficient for trade-off of sparsity loss term. Default: 1e-5.
         distillation_temperature (float): Knowledge Distillation temperature. Default: 4.
         distillation_alpha (float): Knowledge Distillation alpha. Default: 0.9.
-        tolerance (float):
+        tolerance (float): Default: 0.01.
         margin (float): Parameter a in Eq. 5 of the paper. Default: 0.0001.
         sigmoid_a (float): Slope parameter of sigmoidal progress function. Default: 10.
-        finetune_epoch (int): Number of epochs with pruning parameters fixed. Default: 40.
+        upper_bound (float): Default: 1e10.
     """
-    def __init__(self, budget: float, progress_func: str = "sigmoid", _lambda: float = 1e-5, 
-            distillation_temperature: float = 4., distillation_alpha: float = 0.9,
-            tolerance: float = 0.01, margin: float = 0.0001, sigmoid_a: float = 10.,
-            finetune_epoch: int = 40) -> None:
+    def __init__(self, budget: float, epochs: int, progress_func: str = "sigmoid", 
+            _lambda: float = 1e-5, distillation_temperature: float = 4., 
+            distillation_alpha: float = 0.9, tolerance: float = 0.01, margin: float = 1e-4,
+            sigmoid_a: float = 10., upper_bound: float = 1e10) -> None:
         super(BARStructuredLoss, self).__init__()
         self.budget = budget
+        self.epochs = epochs
 
         self.progress_func = progress_func
         self.sigmoid_a = sigmoid_a
         self.tolerance = tolerance
+        self.upper_bound = upper_bound
         
         self._lambda = _lambda
         self.margin = margin
 
         self.classification_criterion = DistillationLoss(distillation_temperature, distillation_alpha)
         self.budget_criterion = BudgetLoss()
+
+        self._origin_overhead = None
 
     def forward(self, input: Tensor, output: Tensor, target: Tensor, 
             net: nn.Module, teacher: nn.Module, current_epoch_fraction: float) -> Tensor:
@@ -114,7 +134,9 @@ class BARStructuredLoss(nn.Module):
             loss (Tensor): The loss.
         """
         # Step 1: Calculate the cross-entropy loss and distillation loss.
-        classification_loss = self.classification_criterion(output, teacher(input), target)
+        with torch.no_grad():
+            teacher_output = teacher(input)
+        classification_loss = self.classification_criterion(output, teacher_output, target)
 
         # Step 2: Calculate the budget loss.
         budget_loss = self.budget_criterion(net)
@@ -124,21 +146,23 @@ class BARStructuredLoss(nn.Module):
         origin_overhead = self.origin_overhead(net)
         tolerant_overhead = (1. + self.tolerance) * origin_overhead
         
-        p = current_epoch_fraction / self.fine_epoch
-        if progress_func == "sigmoid":
-            p = self.sigmoid_progress_fn(p, self.sigmoid_a)
-        elif progress_func == "exp":
-            p = self.exp_progress_fn(p)
+        p = current_epoch_fraction / self.epochs
+        if self.progress_func == "sigmoid":
+            p = sigmoid_progress_fn(p, self.sigmoid_a)
+        elif self.progress_func == "exp":
+            p = exp_progress_fn(p)
+        
         current_budget = (1 - p) * tolerant_overhead + p * self.budget * origin_overhead
 
         margin = tolerant_overhead * self.margin
-        lower_bound = self.budget - self.margin
+        lower_bound = self.budget * origin_overhead - self.margin
         budget_respect = (current_overhead - lower_bound) / (current_budget - lower_bound)
         budget_respect = max(budget_respect, 0.)
-        upper_bound = 1e10
-
-        lamb_mult = budget_respect ** 2 / (1.0 - budget_respect) \
-                if budget_respect < 1. else upper_bound
+        
+        if budget_respect < 1.:
+            lamb_mult = min(budget_respect ** 2 / (1. - budget_respect), self.upper_bound)
+        else:
+            lamb_mult = self.upper_bound
 
         # Step 4: Combine the objectives.
         loss = classification_loss + self._lambda / len(input) * lamb_mult * budget_loss
@@ -171,12 +195,15 @@ class BARStructuredLoss(nn.Module):
         Returns:
             overhead (float): The origin computation overhead before pruning.
         """
-        overhead = 0
+        if self._origin_overhead:
+            return self._origin_overhead
+
+        self._origin_overhead = 0
         for name, m in net.named_modules():
             if isinstance(m, BARStructuredWrapper):
                 nchannels = len(m.log_alpha)
-                overhead += m.computation_overhead * nchannels
-        return overhead
+                self._origin_overhead += m.computation_overhead * nchannels
+        return self._origin_overhead
 
     def sparsity_ratio(self, net: nn.Module) -> float:
         r"""
@@ -192,16 +219,3 @@ class BARStructuredLoss(nn.Module):
         origin_overhead = self.origin_overhead(net)
         sparsity_ratio = current_overhead / origin_overhead
         return sparsity_ratio
-
-    @classmethod
-    def exp_progress_fn(p: float, a: float = 4.) -> float:
-        c = 1. - np.exp(-a)
-        exp_progress = 1. - np.exp(-a * p)
-        return exp_progress / c
-
-    @classmethod
-    def sigmoid_progress_fn(p: float, a: float) -> float:
-        b = 1. / (1. + np.exp(a * 0.5))
-        sigmoid_progress = 1. / (1. + np.exp(a * (0.5 - p)))
-        sigmoid_progress = (sigmoid_progress - b) / (1. - 2. * b)
-        return sigmoid_progress

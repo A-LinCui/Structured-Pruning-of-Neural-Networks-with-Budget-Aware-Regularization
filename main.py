@@ -1,176 +1,123 @@
 import argparse
 import os
+import yaml
+import shutil
+import subprocess
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import torch.utils.data as data
-
-import extorch.vision.dataset as dataset
 import extorch.utils as utils
-
-from model.resnet import CIFARResNet18
-from criterion import BARStructuredLoss
-
-
-def train_epoch(net, trainloader, device, optimizer, criterion, epoch, report_every, logger, grad_clip = None):
-    objs = utils.AverageMeter()
-    top1 = utils.AverageMeter()
-    top5 = utils.AverageMeter()
-    
-    net.train()
-    for step, (inputs, labels) in enumerate(trainloader):
-        current_epoch_fraction = epoch - 1 + step / len(trainloader)
-
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        optimizer.zero_grad()
-        logits = net(inputs)
-        loss = criterion(logits, labels)
-        loss.backward()
-        if grad_clip is not None:
-            nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-        optimizer.step()
-        prec1, prec5 = utils.accuracy(logits, labels, topk = (1, 5))
-        n = inputs.size(0)
-        objs.update(loss.item(), n)
-        top1.update(prec1.item(), n)
-        top5.update(prec5.item(), n)
-        del loss
-        if (step + 1) % report_every == 0:
-            logger.info("Epoch {} train {} / {} {:.3f}; {:.3f}%; {:.3f}%".format(
-                epoch, step + 1, len(trainloader), objs.avg, top1.avg, top5.avg))
-   
-    return objs.avg, top1.avg, top5.avg
-
-
-def valid(net, testloader, device, optimizer, criterion, epoch, report_every, logger):
-    objs = utils.AverageMeter()
-    top1 = utils.AverageMeter()
-    top5 = utils.AverageMeter()
-
-    net.eval()
-    with torch.no_grad():
-        for step, (inputs, labels) in enumerate(testloader):
-            current_epoch_fraction = epoch - 1 + step / len(testloader)
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            logits = net(inputs)
-            loss = criterion(logits, labels)
-            prec1, prec5 = utils.accuracy(logits, labels, topk = (1, 5))
-            n = inputs.size(0)
-            objs.update(loss.item(), n)
-            top1.update(prec1.item(), n)
-            top5.update(prec5.item(), n)
-            del loss
-            if (step + 1) % report_every == 0:
-                logger.info("Epoch {} valid {} / {} {:.3f}; {:.3f}%; {:.3f}%".format(
-                    epoch, step + 1, len(testloader), objs.avg, top1.avg, top5.avg))
-    
-    return objs.avg, top1.avg, top5.avg
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--budget", type = float, required = True, help = "target budget")
-    parser.add_argument("--progress-func", type = str, choices = ["sigmoid", "exp"], 
-            default = "sigmoid", help = "type of progress function")
-    parser.add_argument("--_lambda", type = float, default = 1e-5, 
-            help = "coefficient for trade-off of sparsity loss term")
-    parser.add_argument("--distillation-temperature", type = float, default = 4., 
-            help = "knowledge distillation temperature")
-    parser.add_argument("--distillation-alpha", type = float, default = 0.9, 
-            help = "knowledge distillation alpha")
-    parser.add_argument("--tolerance", type = float, default = 0.01)
-    parser.add_argument("--margin", type = float, default = 0.0001, 
-            help = "parameter a in Eq. 5 of the paper")
-    parser.add_argument("--sigmoid-a", type = float, default = 10., 
-            help = "slope parameter of sigmoidal progress function")
-    parser.add_argument("--finetune-epoch", type = int, default = 40, 
-            help = "number of epochs with pruning parameters fixed")    
+    parser.add_argument("--cfg-file", type = str, required = True, help = "configuration file")
     parser.add_argument("--data-dir", type = str, default = "./")
     parser.add_argument("--train-dir", type = str, default = None)
     parser.add_argument("--save-every", type = int, default = 50)
     parser.add_argument("--gpu", type = int, default = 0, help = "gpu device id")
-    parser.add_argument("--epochs", default = 100, type = int)
+    
     parser.add_argument("--num-workers", default = 2, type = int)
     parser.add_argument("--batch-size", default = 64, type = int)
     parser.add_argument("--report-every", default = 100, type = int)
     parser.add_argument("--seed", default = None, type = int)
-    parser.add_argument("--lr", default = 0.001, type = float)
-    parser.add_argument("--weight-decay", default = 5.e-4, type = float)
-    parser.add_argument("--eta_min", default = 1.e-4, type = float)
-    parser.add_argument("--grad-clip", default = 5., type = float)
     args = parser.parse_args()
 
-    LOGGER = utils.getLogger("Main")
-
+    with open(args.cfg_file, "r") as rf:
+        cfg = yaml.load(rf, Loader = yaml.FullLoader)
+    
     if args.train_dir:
         utils.makedir(args.train_dir, remove = True)
-        LOGGER.addFile(os.path.join(args.train_dir, "train.log"))
+        shutil.copyfile(args.cfg_file, os.path.join(args.train_dir, "train_config.yaml"))
 
-    DEVICE = torch.device("cuda:{}".format(args.gpu)) \
-            if torch.cuda.is_available() else torch.device("cpu")
-
+    base_command = "--data-dir {} --gpu {} --num-workers {} --save-every {} --report-every {}".\
+        format(args.data_dir, args.gpu, args.num_workers, args.save_every, args.report_every)
     if args.seed:
-        utils.set_seed(args.seed)
-        LOGGER.info("Set seed: {}".format(args.seed))
+        base_command += " --seed {}".format(args.seed)
 
-    # Use the CIFAR-10 dataset in extorch with the default transformation
-    datasets = dataset.CIFAR10(args.data_dir, cutout_length = 16)
-    trainloader = data.DataLoader(dataset = datasets.splits["train"], \
-            batch_size = args.batch_size, num_workers = args.num_workers, shuffle = True)
-    testloader = data.DataLoader(dataset = datasets.splits["test"], \
-            batch_size = args.batch_size, num_workers = args.num_workers, shuffle = False)
+    # Step 1: Pretrain the network
+    epochs = cfg["pretrain_cfg"]["epochs"]
+    batch_size = cfg["pretrain_cfg"]["batch_size"]
+    weight_decay = cfg["pretrain_cfg"]["weight_decay"]
+    grad_clip = cfg["pretrain_cfg"]["grad_clip"]
+    lr = cfg["pretrain_cfg"]["lr"]
+    gamma = cfg["pretrain_cfg"]["gamma"]
+    milestones = ""
+    for milestone in cfg["pretrain_cfg"]["milestones"]:
+        milestones += " {}".format(milestone)
 
-    # Construct the network
-    net = CIFARResNet18(num_classes = datasets.num_classes())
-    net.add_wrapper(before_bn = False)
-    net = net.to(DEVICE)
-    num_params = utils.get_params(net)
-    LOGGER.info("Parameter size: {:.5f}M".format(num_params / 1.e6))
+    command = "python normal_train.py --epochs {} --batch-size {} --weight-decay {}" \
+              " --lr {} --milestones {} --gamma {}".format(
+                epochs, batch_size, weight_decay, lr, milestones, gamma)
 
-    criterion = BARStructuredLoss(
-        args.budget, args.progress_func, args._lambda, args.distillation_temperature, 
-        args.distillation_alpha, args.tolerance, args.margin, args.sigmoid_a, args.finetune_epoch
-    )
-    
-    # Construct the optimizer
-    # TODO: No weight decay for GATE
-    optimizer = optim.Adam(list(net.parameters()), lr = args.lr, weight_decay = args.weight_decay)
-
-    # Construct the learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, eta_min = args.eta_min, T_max = args.epochs)
-    
-    time_estimator = utils.TimeEstimator(args.epochs)
-
-    for epoch in range(1, args.epochs + 1):
-        LOGGER.info("Epoch {} lr {:.5f}".format(epoch, optimizer.param_groups[0]["lr"]))
-
-        loss, acc, acc_top5 = train_epoch(net, trainloader, DEVICE, optimizer, criterion, 
-                epoch, args.report_every, LOGGER, args.grad_clip) 
-        LOGGER.info("Train epoch {} / {}: obj {:.3f}; Acc. Top-1 {:.3f}%; Top-5 {:.3f}%".format(
-                epoch, args.epochs, loss, acc, acc_top5))
-
-        loss, acc, acc_top5 = valid(net, testloader, DEVICE, optimizer, criterion, 
-                epoch, args.report_every, LOGGER) 
-        LOGGER.info("TEST epoch {} / {}: obj {:.3f}; Acc. Top-1 {:.3f}%; Top-5 {:.3f}%".format(
-                epoch, args.epochs, loss, acc, acc_top5))
-
-        if epoch % args.save_every == 0 and args.train_dir:
-            save_path = os.path.join(args.train_dir, "model_state_{}.ckpt".format(epoch))
-            torch.save(net.state_dict(), save_path)
-            LOGGER.info("Save checkpoint at {}".format(save_path))
-        
-        LOGGER.info("Iter {} / {} Remaining time: {} / {}".format(epoch, args.epochs, *time_estimator.step()))
-
-        scheduler.step()
+    if grad_clip:
+        command += " --grad-clip {}".format(grad_clip)
 
     if args.train_dir:
-        save_path = os.path.join(args.train_dir, "final.ckpt")
-        torch.save(net.state_dict(), save_path)
-        LOGGER.info("Save checkpoint at {}".format(save_path))
+        pretrain_path = os.path.join(args.train_dir, "pretrain")
+        command += " --train-dir {}".format(pretrain_path)
+
+    command += " " + base_command
+    subprocess.check_call(command, shell = True)
+
+    # Step 2: Pruning
+    epochs = cfg["prune_cfg"]["epochs"]
+    batch_size = cfg["prune_cfg"]["batch_size"]
+    weight_decay = cfg["prune_cfg"]["weight_decay"]
+    lr = cfg["prune_cfg"]["lr"]
+    grad_clip = cfg["prune_cfg"]["grad_clip"]
+    budget = cfg["prune_cfg"]["budget"]
+    progress_func = cfg["prune_cfg"]["progress_func"]
+    _lambda = cfg["prune_cfg"]["_lambda"]
+    distillation_temperature = cfg["prune_cfg"]["distillation_temperature"]
+    distillation_alpha = cfg["prune_cfg"]["distillation_alpha"]
+    tolerance = cfg["prune_cfg"]["tolerance"]
+    margin = cfg["prune_cfg"]["margin"]
+    sigmoid_a = cfg["prune_cfg"]["sigmoid_a"]
+    upper_bound = cfg["prune_cfg"]["upper_bound"]
+    load = os.path.join(pretrain_path, "final.ckpt")
+
+    command = "python prune_train.py --epochs {} --batch-size {} --weight-decay {}" \
+              " --lr {} --budget {} --progress-fun {} --_lambda {}"\
+              " --distillation-temperature {} --distillation-alpha {} --tolerance {}"\
+              " --margin {} --sigmoid-a {} --upper-bound {} --load {}".format(
+                epochs, batch_size, weight_decay, lr, budget, progress_func, _lambda,
+                distillation_temperature, distillation_alpha, tolerance,
+                margin, sigmoid_a, upper_bound, load)
+
+    if grad_clip:
+        command += " --grad-clip {}".format(grad_clip)
+
+    if args.train_dir:
+        prune_path = os.path.join(args.train_dir, "prune")
+        command += " --train-dir {}".format(prune_path)
+
+    command += " " + base_command
+    subprocess.check_call(command, shell = True)
+
+    # Step 3: Finetune the network
+    epochs = cfg["finetune_cfg"]["epochs"]
+    batch_size = cfg["finetune_cfg"]["batch_size"]
+    weight_decay = cfg["finetune_cfg"]["weight_decay"]
+    grad_clip = cfg["finetune_cfg"]["grad_clip"]
+    lr = cfg["finetune_cfg"]["lr"]
+    gamma = cfg["finetune_cfg"]["gamma"]
+    milestones = ""
+    for milestone in cfg["finetune_cfg"]["milestones"]:
+        milestones += " {}".format(milestone)
+    load = os.path.join(prune_path , "hard_pruned.ckpt")
+
+    command = "python normal_train.py --epochs {} --batch-size {} --weight-decay {}" \
+              " --lr {} --milestones {} --gamma {} --load {}".format(
+                epochs, batch_size, weight_decay, lr, milestones, gamma, load)
+
+    if grad_clip:
+        command += " --grad-clip {}".format(grad_clip)
+
+    if args.train_dir:
+        finetune_path = os.path.join(args.train_dir, "finetune")
+        command += " --train-dir {}".format(finetune_path)
+
+    command += " " + base_command
+    subprocess.check_call(command, shell = True)
 
 
 if __name__ == "__main__":
