@@ -174,7 +174,7 @@ def main():
             normal_params.append(param)
     optimizer = optim.Adam([
         {"params": normal_params, "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": gate_params, "lr": args.lr, "weight_decay": args.weight_decay}
+        {"params": gate_params, "lr": args.lr, "weight_decay": 0.}
     ])
     
     time_estimator = utils.TimeEstimator(args.epochs)

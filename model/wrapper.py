@@ -106,7 +106,7 @@ class BARStructuredWrapper(nn.Module):
                          mode (``False``). Default: ``True``.
 
         Returns:
-            nn.Module: self
+            nn.Module: self.
         """
         self.training = mode
         for module in self.children():
@@ -119,7 +119,7 @@ class BARStructuredWrapper(nn.Module):
         Sets the module in evaluation mode.
 
         Returns:
-            nn.Module: self
+            nn.Module: self.
         """
         return self.train(False)
 

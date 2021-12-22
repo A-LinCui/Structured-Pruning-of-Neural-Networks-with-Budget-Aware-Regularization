@@ -10,9 +10,9 @@ pretrain_cfg:
 prune_cfg:
   lr: 0.001
   epochs: 80
-  batch_size: 128
-  weight_decay: 0.
-  grad_clip: null
+  batch_size: 64
+  weight_decay: 0.0005
+  grad_clip: 5.
   budget: 0.5
   progress_func: sigmoid
   _lambda: 0.00001

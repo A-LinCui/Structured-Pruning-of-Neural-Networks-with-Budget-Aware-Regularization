@@ -16,7 +16,6 @@ def main():
     parser.add_argument("--gpu", type = int, default = 0, help = "gpu device id")
     
     parser.add_argument("--num-workers", default = 2, type = int)
-    parser.add_argument("--batch-size", default = 64, type = int)
     parser.add_argument("--report-every", default = 100, type = int)
     parser.add_argument("--seed", default = None, type = int)
     args = parser.parse_args()

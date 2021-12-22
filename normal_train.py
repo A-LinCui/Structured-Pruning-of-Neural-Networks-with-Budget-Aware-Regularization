@@ -154,7 +154,7 @@ def main():
                 epoch, loss, acc, acc_top5))
 
         if epoch % args.save_every == 0 and args.train_dir:
-            save_path = os.path.join(args.train_dir, str(epoch), "model.ckpt")
+            save_path = os.path.join(args.train_dir, "{}.ckpt".format(epoch))
             torch.save(net, save_path)
             LOGGER.info("Save checkpoint at {}".format(save_path))
         
