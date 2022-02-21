@@ -155,7 +155,7 @@ class BARStructuredLoss(nn.Module):
         current_budget = (1 - p) * tolerant_overhead + p * self.budget * origin_overhead
 
         margin = tolerant_overhead * self.margin
-        lower_bound = self.budget * origin_overhead - self.margin
+        lower_bound = self.budget * origin_overhead - margin
         budget_respect = (current_overhead - lower_bound) / (current_budget - lower_bound)
         budget_respect = max(budget_respect, 0.)
         
